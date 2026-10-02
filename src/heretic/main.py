@@ -37,7 +37,6 @@ import logging
 import math
 import os
 import random
-import re
 import time
 import warnings
 from importlib.metadata import version
@@ -90,6 +89,7 @@ from .utils import (
     get_file_sha256,
     get_readme_intro,
     is_dataset_specification_reproducible,
+    closed_cot_response_prefix,
     is_hf_path,
     load_prompts,
     print,
@@ -501,22 +501,17 @@ def run():
 
         cot_skip_applied = False
 
-        for cot_initializer, closed_cot_block in settings.chain_of_thought_skips:
-            # Match the tag and ignore any whitespace characters following it at the end
-            # (if any), including spaces, tabs, and linebreaks. This is required for models
-            # having whitespaces after the tags.
-            pattern = rf"{re.escape(cot_initializer)}\s*$"
-            match = re.search(pattern, dummy_prompt)
+        closed_cot_prefix = closed_cot_response_prefix(
+            dummy_prompt, settings.chain_of_thought_skips
+        )
 
-            if match:
-                # We use only the closed CoT block here. Any whitespaces
-                # will be handled by the 'Rechecking with prefix' logic below.
-                settings.response_prefix = closed_cot_block
-                print(
-                    f"* Closed Chain-of-Thought block: [bold]{escape(repr(settings.response_prefix))}[/]"
-                )
-                cot_skip_applied = True
-                break
+        if closed_cot_prefix is not None:
+            # Any whitespaces will be handled by the 'Rechecking with prefix' logic below.
+            settings.response_prefix = closed_cot_prefix
+            print(
+                f"* Closed Chain-of-Thought block: [bold]{escape(repr(settings.response_prefix))}[/]"
+            )
+            cot_skip_applied = True
 
         # Fallback to inference for models like mistral-3 which are specifically
         # instructed to generate thinking tags using the system prompt in their
