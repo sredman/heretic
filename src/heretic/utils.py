@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import tempfile
 import traceback
 from dataclasses import dataclass
@@ -132,6 +133,30 @@ def ask_if_unset(value: T, question: Question, unsafe: bool = False) -> T:
             return question.ask()
     else:
         return value
+
+
+def closed_cot_response_prefix(
+    dummy_prompt: str,
+    chain_of_thought_skips: list[tuple[str, str]],
+) -> str | None:
+    """Response prefix that closes a thinking block the chat template already opened.
+
+    Returns None when the template does not open one. When it does, only the part of
+    the closed block that follows the opening tag belongs in the prefix: the template
+    has emitted the opening tag itself, so returning the whole block would repeat it
+    and score every trial on a prompt shape the model is never served.
+    """
+    for cot_initializer, closed_cot_block in chain_of_thought_skips:
+        # Match the tag and ignore any whitespace characters following it at the end
+        # (if any), including spaces, tabs, and linebreaks. This is required for models
+        # having whitespaces after the tags.
+        if re.search(rf"{re.escape(cot_initializer)}\s*$", dummy_prompt) is not None:
+            if closed_cot_block.startswith(cot_initializer):
+                return closed_cot_block[len(cot_initializer) :]
+
+            return closed_cot_block
+
+    return None
 
 
 def is_hf_path(path: str) -> bool:
