@@ -103,7 +103,9 @@ class Model:
             else None
         )
 
-        self.trusted_models = set()
+        # Pre-trusting the model makes every from_pretrained call below take the
+        # model's own remote code rather than the in-tree implementation.
+        self.trusted_models = {settings.model} if settings.trust_remote_code else set()
 
         for dtype in settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]...")
@@ -116,6 +118,9 @@ class Model:
                 # (some models like gpt-oss have issues with explicit None).
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
+
+                if settings.attn_implementation is not None:
+                    extra_kwargs["attn_implementation"] = settings.attn_implementation
 
                 self.model = get_model_class(settings.model).from_pretrained(
                     settings.model,
@@ -180,6 +185,24 @@ class Model:
         print("* Abliterable components:")
         for component, count in all_components.items():
             print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
+
+        if self.has_fused_experts():
+            print(
+                "* [yellow]This model stores its routed experts as fused weight tensors "
+                "rather than as modules, so they cannot carry a LoRA adapter and are not "
+                "abliterated. Only the shared expert and the attention/Mamba output "
+                "projections are.[/]"
+            )
+
+        total_modules = sum(all_components.values())
+
+        if settings.require_abliterable_modules is not None and (
+            total_modules != settings.require_abliterable_modules
+        ):
+            raise Exception(
+                f"Expected {settings.require_abliterable_modules} abliterable modules, "
+                f"found {total_modules}."
+            )
 
     def apply_lora(self, lora_rank: int):
         # Guard against calling this method at the wrong time.
@@ -333,6 +356,9 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
+        if self.settings.attn_implementation is not None:
+            extra_kwargs["attn_implementation"] = self.settings.attn_implementation
+
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
             dtype=self.dtype,
@@ -359,6 +385,10 @@ class Model:
         # Most multimodal models.
         with suppress(Exception):
             return model.model.language_model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
+
+        # NemotronH and other backbone-based hybrid models.
+        with suppress(Exception):
+            return model.backbone.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
 
         # Text-only models.
         return model.model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
@@ -427,11 +457,54 @@ class Model:
             for expert in layer.moe.experts:  # ty:ignore[not-iterable, unresolved-attribute]
                 try_add("mlp.down_proj", expert.output_linear)  # ty: ignore[unresolved-attribute]
 
+        # NemotronH hybrid blocks hold their operator in `mixer`, whichever kind it is:
+        # attention, dense MLP, MoE, or Mamba2.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.mixer.o_proj)  # ty: ignore[unresolved-attribute]
+
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mixer.down_proj)  # ty: ignore[unresolved-attribute]
+
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mixer.shared_experts.down_proj)  # ty: ignore[unresolved-attribute]
+
+        # NemotronH MoE blocks with a latent projection write back through fc2_latent_proj,
+        # which is an nn.Identity on models configured without one.
+        with suppress(Exception):
+            if not isinstance(layer.mixer.fc2_latent_proj, torch.nn.Identity):  # ty: ignore[unresolved-attribute]
+                try_add("mlp.down_proj", layer.mixer.fc2_latent_proj)  # ty: ignore[unresolved-attribute]
+
+        # NemotronH MoE blocks loaded from the model's own remote code keep one MLP
+        # per routed expert. Transformers' in-tree implementation fuses them instead;
+        # see has_fused_experts().
+        with suppress(Exception):
+            for expert in layer.mixer.experts:  # ty:ignore[not-iterable, unresolved-attribute]
+                try_add("mlp.down_proj", expert.down_proj)  # ty: ignore[unresolved-attribute]
+
+        # Mamba2 state-space blocks project back to the residual stream through out_proj.
+        with suppress(Exception):
+            try_add("mamba.out_proj", layer.mixer.out_proj)  # ty: ignore[unresolved-attribute]
+
         # We need at least one module across all components for abliteration to work.
         total_modules = sum(len(mods) for mods in modules.values())
         assert total_modules > 0, "No abliterable modules found in layer"
 
         return modules
+
+    def has_fused_experts(self) -> bool:
+        # Some MoE implementations (e.g. transformers' in-tree NemotronH) hold every
+        # routed expert in one stacked Parameter instead of one module per expert.
+        # PEFT cannot adapt a Parameter, so those weights are outside abliteration.
+        for layer in self.get_layers():
+            experts = getattr(layer, "mixer", None)
+            experts = getattr(experts, "experts", None)
+
+            if experts is not None and isinstance(
+                getattr(experts, "down_proj", None), torch.nn.Parameter
+            ):
+                return True
+
+        return False
 
     def get_abliterable_components(self) -> list[str]:
         components: set[str] = set()

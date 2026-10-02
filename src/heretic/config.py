@@ -198,6 +198,28 @@ class Settings(BaseSettings):
         description="Hugging Face commit hash of the model.",
     )
 
+    trust_remote_code: bool = Field(
+        default=False,
+        description=(
+            "Load the model using its own remote code instead of the in-tree "
+            "Transformers implementation. Needed for models whose in-tree "
+            "implementation fuses modules that Heretic has to adapt separately."
+        ),
+    )
+
+    attn_implementation: str | None = Field(
+        default=None,
+        description='Attention implementation passed to from_pretrained (e.g. "eager").',
+    )
+
+    require_abliterable_modules: int | None = Field(
+        default=None,
+        description=(
+            "Abort unless exactly this many abliterable modules are discovered. "
+            "Guards against a loader change silently shrinking abliteration coverage."
+        ),
+    )
+
     evaluate_model: str | None = Field(
         default=None,
         description=(
